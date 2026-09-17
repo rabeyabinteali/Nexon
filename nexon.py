@@ -171,11 +171,31 @@ STAY_AWAKE_PHRASES = ("awake", "keep listening", "always listen")
 # normal "nexon sleep" way since process_command never sees them directly.
 SLEEP_PHRASES = ("sleep", "go to sleep", "stop listening")
 
-# How long nexon listens after hearing the wake word
+# How long nexon waits for you to actually say the command after it
+# replies "Yes?" (you said just the wake word with nothing after it)
 COMMAND_TIMEOUT = 10
 
-# How long it waits for you to start speaking
-PHRASE_TIME_LIMIT = 4
+# Safety ceiling on how long a single phrase can run in the ALWAYS-ON
+# background listener before it's cut and sent off for recognition
+# regardless of whether you've paused. This is NOT how long nexon "waits
+# to hear you" anymore - the mic is open continuously - it just stops a
+# single phrase from running forever if you never pause. Normally a
+# phrase ends on its own after PAUSE_THRESHOLD seconds of silence.
+PHRASE_TIME_LIMIT = 30
+
+# How long a pause (in seconds) ends a phrase and sends it off for
+# recognition. SpeechRecognition's own default here is 0.8, which is
+# tuned for short, snappy commands - on anything longer, a normal
+# mid-sentence breath or thinking pause easily exceeds 0.8s, so the
+# phrase gets cut there and everything after the pause is either lost or
+# treated as a separate, wake-word-less utterance. 1.4 gives real pauses
+# room without making nexon feel sluggish to respond.
+PAUSE_THRESHOLD = 1.4
+
+# No ceiling at all for dictation (see listen_raw()) - a message you're
+# dictating should only end when you actually stop talking, not when it
+# hits an arbitrary length.
+DICTATION_PHRASE_TIME_LIMIT = None
 
 VOLUME_STEP = 5
 BRIGHTNESS_STEP = 10
@@ -223,6 +243,7 @@ PDF_SEARCH_DIRS = [
 # --------------------------------------------------
 
 recognizer = sr.Recognizer()
+recognizer.pause_threshold = PAUSE_THRESHOLD
 
 # Remembers the last thing OCR'd from WhatsApp so we can tell what's new
 _last_whatsapp_text = ""
@@ -260,6 +281,13 @@ _stay_awake = False
 
 _tts_queue = queue.Queue()
 
+# True while nexon is actually speaking. The background listener (added
+# below) checks this and drops whatever it just heard instead of treating
+# it as a command - otherwise, with the mic always on, nexon's own voice
+# coming out of the speakers can get picked back up and misheard as you
+# talking to it.
+_is_speaking = threading.Event()
+
 
 def _tts_worker():
     try:
@@ -278,11 +306,17 @@ def _tts_worker():
             if text is None:
                 break
             print(f"nexon: {text}")
+            _is_speaking.set()
             engine.say(text)
             engine.runAndWait()
         except Exception as e:
             print(f"TTS error: {e}")
         finally:
+            # Small grace period: audio lingering in the air / speaker
+            # buffers can still reach the mic for a moment after
+            # runAndWait() returns.
+            time.sleep(0.3)
+            _is_speaking.clear()
             _tts_queue.task_done()
 
 
@@ -311,57 +345,155 @@ def speak(text, wait=True):
 # SPEECH RECOGNITION
 # --------------------------------------------------
 
-def listen():
+# --------------------------------------------------
+# ALWAYS-ON BACKGROUND LISTENING
+# --------------------------------------------------
+#
+# The old approach called a blocking listen() in a loop: open the mic,
+# wait up to PHRASE_TIME_LIMIT seconds of audio, close the mic, THEN send
+# it off to Google for recognition, and only after all of that loop back
+# around and open the mic again. Two things fell out of that:
+#
+#   1. PHRASE_TIME_LIMIT was a hard ceiling on the mic capture itself, so
+#      any command that took longer to say than that limit got cut off
+#      mid-sentence.
+#   2. The mic was only ever open DURING that fixed window. Recognition
+#      (a network round-trip to Google) happens after the mic closes, and
+#      there's also the small overhead of tearing down and re-opening the
+#      PyAudio stream every loop iteration. Anything you said during that
+#      gap - including right after nexon finished a previous command -
+#      was simply never captured.
+#
+# SpeechRecognition's listen_in_background() fixes both: it keeps exactly
+# one mic stream open continuously on its own thread for as long as the
+# program runs, and calls a callback for every phrase it detects (a
+# phrase ends on its own after PAUSE_THRESHOLD seconds of silence, not a
+# fixed clock). PHRASE_TIME_LIMIT is only a safety ceiling now, not the
+# listening window, so it can be generous. Recognized text is dropped
+# into a queue; the main loop just pulls from that queue instead of
+# calling into the mic directly, so there's never a gap where nexon isn't
+# listening.
+
+_heard_queue = queue.Queue()
+
+
+def _background_listen_callback(recognizer_instance, audio):
     """
-    Listen through the microphone and return
-    recognized speech as lowercase text.
+    Runs on SpeechRecognition's background thread for every phrase it
+    captures. Recognizes it and, if it's not empty and nexon isn't
+    currently talking (see _is_speaking), drops the text on the queue
+    for the main loop to pick up.
     """
-
-    with sr.Microphone() as source:
-
-        print("Listening...")
-
-        try:
-            audio = recognizer.listen(
-                source,
-                timeout=COMMAND_TIMEOUT,
-                phrase_time_limit=PHRASE_TIME_LIMIT
-            )
-
-        except sr.WaitTimeoutError:
-            return ""
+    if _is_speaking.is_set():
+        return
 
     try:
-        text = recognizer.recognize_google(audio)
-        text = text.lower().strip()
-
-        print(f"You: {text}")
-        return text
-
+        text = recognizer_instance.recognize_google(audio).lower().strip()
     except sr.UnknownValueError:
-        return ""
-
+        return
     except sr.RequestError as e:
         print(f"Speech recognition error: {e}")
+        return
+
+    if text and not _is_speaking.is_set():
+        print(f"You: {text}")
+        _heard_queue.put(text)
+
+
+# Holds the stop_listening() callable SpeechRecognition gives back, so
+# pause/resume can stop and restart the one background stream. Only ever
+# one mic stream should be open at a time - PyAudio doesn't handle two
+# overlapping opens on the same device well - so anything that needs the
+# mic directly (like listen_raw() below) must pause this first.
+_stop_listening = None
+
+
+def start_background_listening():
+    """
+    Calibrates for ambient noise once, then starts the persistent
+    background listener. Returns the stop_listening() callable that
+    SpeechRecognition gives back, so main() can shut it down cleanly.
+    """
+    global _stop_listening
+
+    mic = sr.Microphone()
+
+    with mic as source:
+        print("Calibrating microphone...")
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+
+    # Lock the energy threshold in place after that one calibration
+    # instead of letting it keep auto-adjusting for the rest of the
+    # session. With dynamic adjustment left on, a long-running
+    # background listener can have its threshold drift upward (e.g. from
+    # a fridge humming or a fan kicking in) until it starts reading part
+    # of your actual speech as background noise and cutting phrases
+    # early - which looks exactly like "it heard me but didn't get all
+    # of it." A fixed threshold from a clean calibration is more
+    # predictable for a listener that never stops running.
+    recognizer.dynamic_energy_threshold = False
+
+    _stop_listening = recognizer.listen_in_background(
+        mic,
+        _background_listen_callback,
+        phrase_time_limit=PHRASE_TIME_LIMIT
+    )
+    return _stop_listening
+
+
+def pause_background_listening():
+    """
+    Stops the always-on listener so a call site that needs the mic
+    directly (e.g. listen_raw() for dictation) can open its own stream
+    without fighting the background one for the same device. Always
+    pair with resume_background_listening().
+    """
+    global _stop_listening
+    if _stop_listening is not None:
+        _stop_listening(wait_for_stop=True)
+        _stop_listening = None
+
+
+def resume_background_listening():
+    """Restarts the always-on listener after pause_background_listening()."""
+    if _stop_listening is None:
+        start_background_listening()
+
+
+def get_heard(timeout=None):
+    """
+    Pull the next recognized phrase off the background listener's queue.
+    Returns "" if nothing came in within `timeout` seconds (or
+    immediately, if timeout is None/0 and the queue is empty).
+    """
+    try:
+        return _heard_queue.get(timeout=timeout)
+    except queue.Empty:
         return ""
 
 
 def listen_raw():
     """
-    Like listen(), but preserves original casing/punctuation from the
-    recognizer instead of lowercasing - better for dictating actual
-    messages into chats.
+    Blocking single-shot listen that preserves original casing/
+    punctuation from the recognizer instead of lowercasing - used for
+    dictating actual message text (see dictate_and_type). Pauses the
+    always-on background listener for the duration of the call and
+    resumes it afterward, since only one mic stream can be open at once.
     """
-    with sr.Microphone() as source:
-        print("Listening...")
-        try:
-            audio = recognizer.listen(
-                source,
-                timeout=COMMAND_TIMEOUT,
-                phrase_time_limit=PHRASE_TIME_LIMIT
-            )
-        except sr.WaitTimeoutError:
-            return ""
+    pause_background_listening()
+    try:
+        with sr.Microphone() as source:
+            print("Listening...")
+            try:
+                audio = recognizer.listen(
+                    source,
+                    timeout=COMMAND_TIMEOUT,
+                    phrase_time_limit=DICTATION_PHRASE_TIME_LIMIT
+                )
+            except sr.WaitTimeoutError:
+                return ""
+    finally:
+        resume_background_listening()
 
     try:
         text = recognizer.recognize_google(audio)
@@ -1491,70 +1623,75 @@ def main():
     print("Say 'shutdown assistant' to quit.")
     print()
 
-    # Give microphone time to settle
-    with sr.Microphone() as source:
-        print("Calibrating microphone...")
-        recognizer.adjust_for_ambient_noise(source, duration=1)
+    # Starts one continuously-open mic stream on its own background
+    # thread (includes the ambient-noise calibration that used to happen
+    # here directly) - this replaces the old "open mic, listen, close
+    # mic, repeat" loop, so there's no gap where nexon isn't listening.
+    stop_listening = start_background_listening()
 
     speak("nexon is ready.")
 
     running = True
 
-    while running:
+    try:
+        while running:
 
-        # Listen for anything
-        heard = listen()
+            # Pull the next recognized phrase off the queue. A short
+            # timeout just keeps this loop responsive (e.g. to Ctrl+C);
+            # the mic itself is always listening regardless of this.
+            heard = get_heard(timeout=0.2)
 
-        if not heard:
-            continue
-
-        # ------------------------------------------
-        # STAY-AWAKE MODE: no wake word needed. Every
-        # heard phrase is tried directly as a command.
-        # ------------------------------------------
-
-        if _stay_awake:
-
-            # If old habits kick in and "nexon" still gets said, strip it
-            # off so e.g. "nexon next video" still works while awake.
-            spoken = heard.split(WAKE_WORD, 1)[1].strip() if WAKE_WORD in heard else heard
-
-            if not spoken:
+            if not heard:
                 continue
 
-            if any(phrase in spoken for phrase in SLEEP_PHRASES):
-                _stay_awake = False
-                speak("Going back to sleep. Say nexon to wake me up.")
+            # ------------------------------------------
+            # STAY-AWAKE MODE: no wake word needed. Every
+            # heard phrase is tried directly as a command.
+            # ------------------------------------------
+
+            if _stay_awake:
+
+                # If old habits kick in and "nexon" still gets said, strip it
+                # off so e.g. "nexon next video" still works while awake.
+                spoken = heard.split(WAKE_WORD, 1)[1].strip() if WAKE_WORD in heard else heard
+
+                if not spoken:
+                    continue
+
+                if any(phrase in spoken for phrase in SLEEP_PHRASES):
+                    _stay_awake = False
+                    speak("Going back to sleep. Say nexon to wake me up.")
+                    continue
+
+                running = process_command(spoken)
                 continue
 
-            running = process_command(spoken)
+            # ------------------------------------------
+            # NORMAL MODE: wake word required
+            # ------------------------------------------
 
-            time.sleep(0.1)
-            continue
+            if WAKE_WORD in heard:
 
-        # ------------------------------------------
-        # NORMAL MODE: wake word required
-        # ------------------------------------------
+                # If you said:
+                # "nexon next video"
+                # we can use the rest immediately.
 
-        if WAKE_WORD in heard:
+                command = heard.split(WAKE_WORD, 1)[1].strip()
 
-            # If you said:
-            # "nexon next video"
-            # we can use the rest immediately.
+                if not command:
+                    speak("Yes?")
+                    # Wait for the follow-up command to arrive on the
+                    # queue - the mic never stopped listening in the
+                    # meantime, so nothing said right after "Yes?" is lost.
+                    command = get_heard(timeout=COMMAND_TIMEOUT)
 
-            command = heard.split(WAKE_WORD, 1)[1].strip()
-
-            if not command:
-                speak("Yes?")
-                command = listen()
-
-            if command and any(phrase in command for phrase in STAY_AWAKE_PHRASES):
-                _stay_awake = True
-                speak("I'll stay awake. Just say sleep, or nexon sleep, when you want me to stop.")
-            elif command:
-                running = process_command(command)
-
-        time.sleep(0.1)
+                if command and any(phrase in command for phrase in STAY_AWAKE_PHRASES):
+                    _stay_awake = True
+                    speak("I'll stay awake. Just say sleep, or nexon sleep, when you want me to stop.")
+                elif command:
+                    running = process_command(command)
+    finally:
+        stop_listening(wait_for_stop=False)
 
 
 if __name__ == "__main__":
