@@ -7,7 +7,7 @@ Say **"nexon stay awake"** to skip saying "nexon" every time; say **"sleep"**
 ## Mode
 | Say | Effect |
 |---|---|
-| stay awake | Stops requiring "nexon" before each command |
+| awake | Stops requiring "nexon" before each command |
 | sleep / go to sleep / stop listening | Goes back to requiring "nexon" first |
 | shutdown assistant / exit / quit / goodbye | Closes nexon |
 

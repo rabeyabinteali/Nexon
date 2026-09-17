@@ -160,14 +160,14 @@ keyboard.add_hotkey("ctrl+alt+j", kill_switch)
 
 WAKE_WORD = "nexon"
 
-# Phrases (heard AFTER the wake word) that toggle "stay awake" mode, where
+# Phrases (heard AFTER the wake word) that toggle "awake" mode, where
 # nexon stops requiring the wake word before every command and just tries
 # to match anything it hears against a command instead.
-STAY_AWAKE_PHRASES = ("stay awake", "keep listening", "always listen")
+STAY_AWAKE_PHRASES = ("awake", "keep listening", "always listen")
 
-# Phrases that drop nexon back out of "stay awake" mode into the normal
+# Phrases that drop nexon back out of "awake" mode into the normal
 # wake-word-required state. Checked WITHOUT needing "nexon" first while
-# already in stay-awake mode (that's the whole point), but also work the
+# already in awake mode (that's the whole point), but also work the
 # normal "nexon sleep" way since process_command never sees them directly.
 SLEEP_PHRASES = ("sleep", "go to sleep", "stop listening")
 
@@ -175,7 +175,7 @@ SLEEP_PHRASES = ("sleep", "go to sleep", "stop listening")
 COMMAND_TIMEOUT = 10
 
 # How long it waits for you to start speaking
-PHRASE_TIME_LIMIT = 7
+PHRASE_TIME_LIMIT = 4
 
 VOLUME_STEP = 5
 BRIGHTNESS_STEP = 10
@@ -238,7 +238,7 @@ _stopwatch_start = None
 _active_timers = []
 
 # When True, nexon skips the wake-word check and treats every heard phrase
-# as a command directly. Toggled by "nexon stay awake" / "sleep".
+# as a command directly. Toggled by "nexon awake" / "sleep".
 _stay_awake = False
 
 
@@ -1486,7 +1486,7 @@ def main():
     print("--------------------------------")
     print(f"Wake word: {WAKE_WORD}")
     print("Say 'nexon' to activate.")
-    print("Say 'nexon stay awake' to stop needing the wake word each time.")
+    print("Say 'nexon awake' to stop needing the wake word each time.")
     print("Say 'sleep' (while awake) or 'nexon sleep' to go back to normal.")
     print("Say 'shutdown assistant' to quit.")
     print()
