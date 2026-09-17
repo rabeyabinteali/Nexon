@@ -33,12 +33,25 @@ Extra one-time setup:
       Documents, and Downloads for a matching filename) and reads the real
       text straight from the PDF via PyMuPDF - far more accurate than OCR.
       It remembers which page you're on, so "next page" / "previous page" /
-      "read page 5" work afterward. If a page has no extractable text (a
-      scanned image page), it falls back to OCR on just that page. If no
-      PDF is detected at all, "read screen" falls back to OCR-ing the whole
+      "read page 5" / "go to page 5" work afterward, speaking each new
+      page's text aloud. If a page has no extractable text (a scanned
+      image page), it falls back to OCR on just that page. If no PDF is
+      detected at all, "read screen" falls back to OCR-ing the whole
       screen like before. You can also say "read pdf <name>" to open a
       specific PDF by (partial) filename regardless of what's focused, and
       it loads into nexon so it can be read aloud / paged through.
+
+    - "next page" / "previous page" / "go to page X" work everywhere, not
+      just with a PDF loaded into nexon's own reader: if nexon doesn't
+      have a PDF loaded internally (e.g. you used "launch pdf" instead of
+      "read pdf", or just opened a file by hand), these instead send the
+      matching keystroke to whatever window is focused - Page Down/Page
+      Up for next/previous (works in most PDF viewers, browsers,
+      PowerPoint, ebook readers, etc.), and Ctrl+G for "go to page"
+      (works in most desktop PDF viewers, though not universally - e.g.
+      not in browsers' built-in PDF viewers). In that fallback case
+      nexon can't read the new page's text aloud, since it has no way to
+      know what's now on screen.
 
     - "launch pdf <name>" (or "open pdf <name>") is different from "read
       pdf": it just opens the matching PDF in your normal default PDF
@@ -1073,6 +1086,68 @@ def previous_pdf_page():
 
 
 # --------------------------------------------------
+# UNIVERSAL PAGE NAVIGATION
+# --------------------------------------------------
+#
+# "next page" / "previous page" used to ONLY work if nexon had a PDF
+# loaded internally via open_pdf() (i.e. via "read pdf ..." or "read
+# screen" on a focused PDF). That's a narrow definition of "a PDF is
+# open" - a PDF opened with "launch pdf"/"open pdf" (which uses
+# os.startfile, a real viewer window) or one you opened yourself by
+# hand was never tracked in _pdf_state, so "next page" would say
+# "No PDF is open" even while one was clearly visible on screen.
+#
+# Fix: only use nexon's own page-turn-and-read-aloud logic when nexon
+# actually has a PDF loaded internally (_pdf_state["doc"] is set).
+# Otherwise, just send the standard page-turn keystroke to whichever
+# window currently has focus. This also makes "next page"/"previous
+# page" work generically - PDF viewers, browsers, PowerPoint, ebook
+# readers, etc. - not just nexon's own PDF reader, at the cost of not
+# being able to speak the new page's text aloud in that case (nexon
+# has no way to know what's now on screen without OCR/re-reading).
+
+def handle_next_page():
+    if _pdf_state["doc"] is not None:
+        next_pdf_page()
+    else:
+        pyautogui.press("pagedown")
+        speak("Next page")
+
+
+def handle_previous_page():
+    if _pdf_state["doc"] is not None:
+        previous_pdf_page()
+    else:
+        pyautogui.press("pageup")
+        speak("Previous page")
+
+
+def handle_go_to_page(page_number):
+    """
+    'go to page X'. If nexon has a PDF loaded internally, jump straight
+    there and read it aloud via the existing read_pdf_page() (which
+    already validates the page number). Otherwise, best-effort generic
+    jump: Ctrl+G is the "go to page" shortcut in most desktop PDF
+    viewers (Adobe Reader, Foxit, SumatraPDF). It is NOT universal -
+    browsers' built-in PDF viewers and most non-PDF apps don't support
+    it - but it's the closest thing to a standard shortcut, so it's a
+    reasonable default when nexon isn't tracking the document itself.
+    """
+    if page_number is None:
+        speak("What page?")
+        return
+
+    if _pdf_state["doc"] is not None:
+        read_pdf_page(page_number)
+    else:
+        keyboard.send("ctrl+g")
+        time.sleep(0.3)
+        keyboard.write(str(page_number))
+        keyboard.send("enter")
+        speak(f"Going to page {page_number}")
+
+
+# --------------------------------------------------
 # SCREEN READING (OCR)
 # --------------------------------------------------
 
@@ -1452,11 +1527,24 @@ def process_command(command):
         num = extract_number(command)
         read_pdf_page(num)
 
-    elif "next page" in command:
-        next_pdf_page()
+    # "go to page X" / "jump to page X" - checked BEFORE the plain
+    # "next page"/"previous page" branches below on purpose, since it
+    # would otherwise never be reached ("go to page" doesn't contain
+    # "next page" or "previous page", but checking order matters if you
+    # ever add more page-related phrases here).
+    elif "go to page" in command or "goto page" in command or "jump to page" in command:
+        handle_go_to_page(extract_number(command))
 
-    elif "previous page" in command or "last page" in command or "go back a page" in command:
-        previous_pdf_page()
+    elif "next page" in command or "next slide" in command:
+        handle_next_page()
+
+    elif (
+        "previous page" in command
+        or "last page" in command
+        or "go back a page" in command
+        or "previous slide" in command
+    ):
+        handle_previous_page()
 
     elif "read screen" in command or "what's on my screen" in command or "whats on my screen" in command or "read the screen" in command:
         read_screen()
