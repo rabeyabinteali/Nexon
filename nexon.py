@@ -6,6 +6,11 @@ Install:
                 keyboard pycaw comtypes pytesseract pygetwindow pywhatkit pymupdf Pillow ^
                 requests beautifulsoup4
 
+Recommended for speed (local speech recognition, no network round trip):
+    pip install faster-whisper
+The first run downloads a small speech model (~150 MB for base.en) once.
+If faster-whisper isn't installed, nexon falls back to Google recognition.
+
 If PyAudio gives you trouble on Windows:
     pip install pipwin
     pipwin install pyaudio
@@ -176,7 +181,7 @@ WAKE_WORD = "nexon"
 # Phrases (heard AFTER the wake word) that toggle "awake" mode, where
 # nexon stops requiring the wake word before every command and just tries
 # to match anything it hears against a command instead.
-STAY_AWAKE_PHRASES = ("awake", "keep listening", "always listen")
+STAY_AWAKE_PHRASES = ("awake", "keep listening", "always listen","start listen", "keep listen")
 
 # Phrases that drop nexon back out of "awake" mode into the normal
 # wake-word-required state. Checked WITHOUT needing "nexon" first while
@@ -203,7 +208,44 @@ PHRASE_TIME_LIMIT = 30
 # phrase gets cut there and everything after the pause is either lost or
 # treated as a separate, wake-word-less utterance. 1.4 gives real pauses
 # room without making nexon feel sluggish to respond.
-PAUSE_THRESHOLD = 1.4
+PAUSE_THRESHOLD = 0.9   # was 1.4 - lower = commands start processing sooner.
+                        # Raise it back if long commands get cut at a mid-sentence pause.
+
+# Dictation (listen_raw) keeps the longer pause so mid-message breaths
+# don't end the message early.
+DICTATION_PAUSE_THRESHOLD = 1.4
+
+# Mic sample rate. Most mics default to 44100 Hz, which makes each clip
+# ~2.7x bigger to upload than 16000 Hz - and Google's recognizer doesn't need
+# more. If your mic refuses 16000, nexon falls back to its default rate.
+# Set to None to always use the mic's default.
+MIC_SAMPLE_RATE = 16000
+
+# Which recognizer to use:
+#   "whisper" = runs on your PC (faster-whisper). No network per phrase, so it
+#               typically takes well under a second instead of 2-3s.
+#               Falls back to Google automatically if it can't load.
+#   "google"  = the old online recognizer.
+RECOGNITION_ENGINE = "whisper"
+
+# Model size: "tiny.en" = fastest, "base.en" = good balance, "small.en" = most
+# accurate but slower. Try tiny.en first if base.en feels slow on your CPU.
+WHISPER_MODEL = "base.en"
+
+# Whisper hears "nexon" as other things sometimes. Anything listed here is
+# rewritten to the wake word (only applies to whisper results). Edit freely.
+WAKE_WORD_VARIANTS = ("next on", "nixon", "nexan", "nexen", "nexxon", "nextron", "nexson")
+
+# Hint text that nudges Whisper toward the wake word and your command
+# vocabulary. Not used for dictation.
+WHISPER_PROMPT = (
+    f"{WAKE_WORD}. {WAKE_WORD}, next video. {WAKE_WORD}, volume up. "
+    f"{WAKE_WORD}, read screen. Search, play, open, click, close tab, skip ad, set a timer."
+)
+
+# Prints how long each recognition takes (and, for Google, how big the upload was).
+# Set to False once you're done tuning.
+DEBUG_TIMING = True
 
 # No ceiling at all for dictation (see listen_raw()) - a message you're
 # dictating should only end when you actually stop talking, not when it
@@ -226,6 +268,23 @@ MAX_SPOKEN_CHARS = 500
 # exact/word match is found. Lower = more forgiving, but more false hits.
 PDF_FUZZY_MATCH_THRESHOLD = 0.55
 
+# OCR speed: screenshots wider than this are shrunk before Tesseract sees
+# them (results are scaled back, so clicking still lands correctly).
+# Only matters on screens wider than 1920px.
+OCR_MAX_WIDTH = 1920
+
+# "skip ad" only scans the lower-right part of the screen, where the skip
+# button lives. These are the fractions of screen width/height to cut off
+# from the left/top. Set both to 0.0 to scan the whole screen again.
+SKIP_SCAN_LEFT = 0.0
+SKIP_SCAN_TOP = 0.25
+
+# PDF filename index is cached instead of rescanning your folders on every
+# command. It's rebuilt after this many seconds, or once early if a PDF
+# isn't found (in case you just added it).
+PDF_INDEX_MAX_AGE = 300
+PDF_INDEX_MIN_REFRESH = 30
+
 # Common site shortcuts so "open youtube" works without saying ".com"
 SITE_SHORTCUTS = {
     "youtube": "https://youtube.com",
@@ -241,6 +300,8 @@ SITE_SHORTCUTS = {
     "netflix": "https://netflix.com",
     "amazon": "https://amazon.com",
     "ao3" : "https://archiveofourown.org/",
+    "archiveofourown" : "https://archiveofourown.org/",
+    "archive of our own" : "https://archiveofourown.org/",
 }
 
 # Folders searched (recursively) when trying to locate a PDF by filename
@@ -257,6 +318,8 @@ PDF_SEARCH_DIRS = [
 
 recognizer = sr.Recognizer()
 recognizer.pause_threshold = PAUSE_THRESHOLD
+# Without this, recognize_google() can wait forever on a bad connection.
+recognizer.operation_timeout = 10
 
 # Remembers the last thing OCR'd from WhatsApp so we can tell what's new
 _last_whatsapp_text = ""
@@ -390,27 +453,168 @@ def speak(text, wait=True):
 _heard_queue = queue.Queue()
 
 
+# --------------------------------------------------
+# LOCAL SPEECH RECOGNITION (faster-whisper)
+# --------------------------------------------------
+
+_whisper_model = None
+_whisper_failed = False
+_whisper_lock = threading.Lock()
+
+
+def _get_whisper():
+    """
+    Load the local model once (first call downloads it). Returns the model,
+    or None if it isn't available - in which case callers use Google.
+    """
+    global _whisper_model, _whisper_failed
+    if _whisper_model is not None or _whisper_failed:
+        return _whisper_model
+
+    with _whisper_lock:
+        if _whisper_model is not None or _whisper_failed:
+            return _whisper_model
+        try:
+            import numpy as np
+            from faster_whisper import WhisperModel
+
+            print(f"Loading local speech model '{WHISPER_MODEL}' (first run downloads it)...")
+            model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            # Warm-up: the very first inference is always slower.
+            list(model.transcribe(np.zeros(16000, dtype="float32"), language="en")[0])
+            _whisper_model = model
+            print("Local speech model ready.")
+        except Exception as e:
+            print(f"Local speech model unavailable ({e}).")
+            print("Using Google recognition instead. For faster recognition: pip install faster-whisper")
+            _whisper_failed = True
+    return _whisper_model
+
+
+def _use_local_engine():
+    return RECOGNITION_ENGINE == "whisper" and _get_whisper() is not None
+
+
+def _normalize_command_text(text):
+    """
+    Whisper adds capitals and punctuation ("Nexon, next video."); the command
+    matching below expects plain lowercase words like Google returned.
+    """
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    for variant in WAKE_WORD_VARIANTS:
+        text = re.sub(rf"\b{re.escape(variant)}\b", WAKE_WORD, text)
+    return text
+
+
+def _recognize_local(audio, use_prompt=True):
+    """
+    Transcribe an sr.AudioData clip on this PC. Returns the text with Whisper's
+    own casing/punctuation ("" if nothing was said).
+    """
+    import numpy as np
+
+    model = _get_whisper()
+    raw = audio.get_raw_data(convert_rate=16000, convert_width=2)
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    segments, _info = model.transcribe(
+        samples,
+        language="en",
+        beam_size=1,                      # greedy decoding: fastest
+        temperature=0.0,                  # no slow retry loop
+        vad_filter=True,                  # skips silence/noise-only clips
+        condition_on_previous_text=False,
+        initial_prompt=WHISPER_PROMPT if use_prompt else None,
+    )
+
+    parts = []
+    for seg in segments:
+        # Drop segments Whisper itself thinks aren't really speech.
+        if seg.no_speech_prob > 0.6 and seg.avg_logprob < -1.0:
+            continue
+        parts.append(seg.text.strip())
+    text = " ".join(p for p in parts if p).strip()
+
+    # If Whisper just echoes the hint text back on a noisy clip, ignore it.
+    if use_prompt and len(text.split()) >= 6:
+        if _normalize_command_text(text) in _normalize_command_text(WHISPER_PROMPT):
+            return ""
+    return text
+
+
+def _recognize_command(audio):
+    """Audio -> plain lowercase command text ('' if nothing). Local model first, Google as fallback."""
+    if _use_local_engine():
+        t0 = time.time()
+        text = _normalize_command_text(_recognize_local(audio))
+        if DEBUG_TIMING:
+            secs = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+            print(f"[local {WHISPER_MODEL} | audio {secs:.1f}s | took {time.time() - t0:.2f}s]")
+        return text
+
+    if DEBUG_TIMING:
+        # Measured separately so "encoding the audio" can be told apart from
+        # "waiting on Google": network time is roughly (total - encode).
+        secs = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+        t_enc = time.time()
+        flac_kb = len(audio.get_flac_data()) / 1024
+        enc = time.time() - t_enc
+
+    t0 = time.time()
+    text = recognizer.recognize_google(audio).lower().strip()
+
+    if DEBUG_TIMING:
+        total = time.time() - t0
+        print(f"[google | audio {secs:.1f}s, {flac_kb:.0f}KB upload | "
+              f"encode {enc:.2f}s | recognize total {total:.2f}s | "
+              f"network ~{max(total - enc, 0):.2f}s]")
+    return text
+
+
+_audio_queue = queue.Queue()
+
+
 def _background_listen_callback(recognizer_instance, audio):
     """
-    Runs on SpeechRecognition's background thread for every phrase it
-    captures. Recognizes it and, if it's not empty and nexon isn't
-    currently talking (see _is_speaking), drops the text on the queue
-    for the main loop to pick up.
+    Runs on SpeechRecognition's listener thread for every captured phrase.
+    It must return FAST: while this callback runs, the mic isn't being read.
+    So it only hands the audio to _recognition_worker (below), which does
+    the slow network call to Google on its own thread.
     """
     if _is_speaking.is_set():
         return
+    _audio_queue.put(audio)
 
-    try:
-        text = recognizer_instance.recognize_google(audio).lower().strip()
-    except sr.UnknownValueError:
-        return
-    except sr.RequestError as e:
-        print(f"Speech recognition error: {e}")
-        return
 
-    if text and not _is_speaking.is_set():
-        print(f"You: {text}")
-        _heard_queue.put(text)
+def _recognition_worker():
+    """Turns queued audio into text (one phrase at a time, in order)."""
+    while True:
+        audio = _audio_queue.get()
+        if audio is None:
+            break
+
+        if _is_speaking.is_set():
+            continue
+
+        try:
+            text = _recognize_command(audio)
+        except sr.UnknownValueError:
+            continue
+        except sr.RequestError as e:
+            print(f"Speech recognition error: {e}")
+            continue
+        except Exception as e:  # e.g. socket timeout
+            print(f"Speech recognition error: {e}")
+            continue
+
+        if text and not _is_speaking.is_set():
+            print(f"You: {text}")
+            _heard_queue.put(text)
+
+
+_recognition_thread = threading.Thread(target=_recognition_worker, daemon=True)
+_recognition_thread.start()
 
 
 # Holds the stop_listening() callable SpeechRecognition gives back, so
@@ -421,6 +625,24 @@ def _background_listen_callback(recognizer_instance, audio):
 _stop_listening = None
 
 
+_mic_sample_rate = MIC_SAMPLE_RATE
+_mic_rate_verified = False
+
+
+def _make_microphone():
+    """sr.Microphone at MIC_SAMPLE_RATE, falling back to the mic's default rate if unsupported."""
+    global _mic_sample_rate, _mic_rate_verified
+    if _mic_sample_rate is not None and not _mic_rate_verified:
+        try:
+            with sr.Microphone(sample_rate=_mic_sample_rate):
+                pass
+            _mic_rate_verified = True
+        except Exception as e:
+            print(f"Mic can't do {_mic_sample_rate} Hz ({e}); using its default rate instead.")
+            _mic_sample_rate = None
+    return sr.Microphone(sample_rate=_mic_sample_rate)
+
+
 def start_background_listening():
     """
     Calibrates for ambient noise once, then starts the persistent
@@ -429,7 +651,7 @@ def start_background_listening():
     """
     global _stop_listening
 
-    mic = sr.Microphone()
+    mic = _make_microphone()
 
     with mic as source:
         print("Calibrating microphone...")
@@ -494,8 +716,9 @@ def listen_raw():
     resumes it afterward, since only one mic stream can be open at once.
     """
     pause_background_listening()
+    recognizer.pause_threshold = DICTATION_PAUSE_THRESHOLD
     try:
-        with sr.Microphone() as source:
+        with _make_microphone() as source:
             print("Listening...")
             try:
                 audio = recognizer.listen(
@@ -506,17 +729,23 @@ def listen_raw():
             except sr.WaitTimeoutError:
                 return ""
     finally:
+        recognizer.pause_threshold = PAUSE_THRESHOLD
         resume_background_listening()
 
     try:
-        text = recognizer.recognize_google(audio)
+        if _use_local_engine():
+            text = _recognize_local(audio, use_prompt=False)
+        else:
+            text = recognizer.recognize_google(audio)
+        if not text.strip():
+            return ""
         print(f"You (dictated): {text}")
         return text.strip()
 
     except sr.UnknownValueError:
         return ""
 
-    except sr.RequestError as e:
+    except (sr.RequestError, OSError) as e:  # OSError covers socket timeouts
         print(f"Speech recognition error: {e}")
         return ""
 
@@ -684,6 +913,34 @@ def play_pause():
     pyautogui.press("space")
 
 
+def _shrink_for_ocr(image):
+    """Downscale very wide screenshots so Tesseract runs faster. Returns (image, scale)."""
+    w, h = image.size
+    if w <= OCR_MAX_WIDTH:
+        return image, 1.0
+    scale = w / OCR_MAX_WIDTH
+    return image.resize((OCR_MAX_WIDTH, round(h / scale))), scale
+
+
+def _ocr_data(image):
+    """
+    pytesseract.image_to_data() on a (possibly shrunk) image, with word
+    positions scaled back to the original image's pixel coordinates.
+    Returns the data dict, or None on failure.
+    """
+    small, scale = _shrink_for_ocr(image)
+    try:
+        data = pytesseract.image_to_data(small, output_type=pytesseract.Output.DICT)
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return None
+
+    if scale != 1.0:
+        for key in ("left", "top", "width", "height"):
+            data[key] = [round(v * scale) for v in data[key]]
+    return data
+
+
 def _find_and_click_skip_button():
     """
     One OCR pass over the screen: look for a word containing 'skip'.
@@ -695,13 +952,24 @@ def _find_and_click_skip_button():
     other side of the screen would otherwise be mistaken for a countdown
     and block every click for the whole ad.
     Returns True if it clicked something.
+
+    Only the lower-right part of the screen is scanned (see SKIP_SCAN_LEFT /
+    SKIP_SCAN_TOP) - much faster than OCR-ing the whole screen every poll.
     """
-    screenshot = pyautogui.screenshot()
-    try:
-        data = pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
-    except Exception as e:
-        print(f"OCR error: {e}")
+    full = pyautogui.screenshot()
+    full_w, full_h = full.size
+    off_x, off_y = int(full_w * SKIP_SCAN_LEFT), int(full_h * SKIP_SCAN_TOP)
+    region = full.crop((off_x, off_y, full_w, full_h)).convert("L")
+
+    t_scan = time.time()
+    data = _ocr_data(region)
+    if data is None:
         return False
+
+    if DEBUG_TIMING:
+        seen = [w for w in data["text"] if "skip" in w.lower()]
+        print(f"[skip scan {region.size[0]}x{region.size[1]} took {time.time() - t_scan:.1f}s"
+              f" | words containing 'skip': {seen or 'none'}]")
 
     n = len(data["text"])
 
@@ -733,14 +1001,30 @@ def _find_and_click_skip_button():
                 break
 
         if nearby_has_digit:
+            if DEBUG_TIMING:
+                print("[skip button found but a countdown number is next to it - waiting]")
             continue  # still counting down ("Skip Ad in 4") - not clickable yet
 
-        x = skip_left + skip_width // 2
-        y = data["top"][i] + skip_height // 2
+        # Convert screenshot pixels to mouse coordinates. On Windows with
+        # display scaling (125%, 150%...) these differ, and clicking at raw
+        # screenshot coordinates lands in the wrong place (same correction
+        # click_on_screen already applies).
+        screen_w, screen_h = pyautogui.size()
+        x = round((off_x + skip_left + skip_width // 2) * screen_w / full_w)
+        y = round((off_y + data["top"][i] + skip_height // 2) * screen_h / full_h)
+        if DEBUG_TIMING:
+            print(f"[skip click at ({x}, {y}) | screenshot {full_w}x{full_h}, mouse space {screen_w}x{screen_h}]")
         pyautogui.click(x, y)
         return True
 
     return False
+
+
+def _is_skip_ad_command(command):
+    """True for "skip ad", "skip the ad", "skip ads", and common mishearings like "skip add" / "skip a d"."""
+    if "skip ad" in command or "skip the ad" in command or "skip this ad" in command or "skip ads" in command:
+        return True
+    return bool(re.search(r"\bskip(ped)?\b(\s+(the|this|that|an|a))?\s+(ad|ads|add|adds|a d)\b", command))
 
 
 def _skip_ad_worker(max_wait=20, poll_interval=1.5):
@@ -864,16 +1148,11 @@ def clear_recycle_bin():
 import requests
 from bs4 import BeautifulSoup
 
-def google_search(query, read_result=True):
-    url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
-    webbrowser.open(url) 
-    if not read_result:
-        return
-
-    speak(f"Searching for {query}.")
+def _read_google_result(url):
+    """Fetch the results page and read the top result aloud (runs on its own thread)."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        resp = requests.get(url, headers=headers, timeout=8)
+        resp = requests.get(url, headers=headers, timeout=5)
         resp.raise_for_status()
     except Exception as e:
         print(f"Search fetch error: {e}")
@@ -890,6 +1169,19 @@ def google_search(query, read_result=True):
     snippet_tag = result.find("span")
     snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
     speak_long_text(f"{title}. {snippet}" if snippet else title, prefix="Top result:")
+
+
+def google_search(query, read_result=True):
+    url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
+    webbrowser.open(url)
+    if not read_result:
+        return
+
+    speak(f"Searching for {query}.", wait=False)
+    # The network fetch happens in the background so nexon can take your
+    # next command instead of freezing for up to 5 seconds.
+    threading.Thread(target=_read_google_result, args=(url,), daemon=True).start()
+
 
 # --------------------------------------------------
 # PDF READING
@@ -914,11 +1206,71 @@ def _normalize_for_match(text):
     return text.strip()
 
 
+# Cached list of (path, normalized_name, name_words) for every PDF under
+# PDF_SEARCH_DIRS. Walking those folders is the slow part of finding a PDF,
+# so it's done once (in the background at startup) and reused.
+_pdf_index = []
+_pdf_index_time = 0.0
+_pdf_index_lock = threading.Lock()
+_PDF_SKIP_DIRS = {"node_modules", "__pycache__", "venv", "env", "site-packages"}
+
+
+def _build_pdf_index_locked():
+    """Rescan PDF_SEARCH_DIRS. Caller must hold _pdf_index_lock."""
+    global _pdf_index, _pdf_index_time
+    entries = []
+    for folder in PDF_SEARCH_DIRS:
+        if not os.path.isdir(folder):
+            continue
+        for root, dirs, files in os.walk(folder):
+            # Skip hidden folders and huge dependency folders.
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(".") and d.lower() not in _PDF_SKIP_DIRS]
+            for name in files:
+                if name.startswith(".") or not name.lower().endswith(".pdf"):
+                    continue
+                base_norm = _normalize_for_match(os.path.splitext(name)[0])
+                if base_norm:
+                    entries.append((os.path.join(root, name), base_norm, base_norm.split()))
+    _pdf_index = entries
+    _pdf_index_time = time.time()
+
+
+def _get_pdf_index(max_age=PDF_INDEX_MAX_AGE):
+    """Return the cached PDF list, rescanning if it's missing or older than max_age seconds."""
+    with _pdf_index_lock:
+        if _pdf_index_time == 0.0 or time.time() - _pdf_index_time > max_age:
+            _build_pdf_index_locked()
+        return _pdf_index
+
+
+def _match_pdf(hint_norm, hint_words, index):
+    best_path = None
+    best_rank = None
+
+    for path, base_norm, base_words in index:
+        if hint_norm in base_norm:
+            rank = (0, 0)
+        elif all(w in base_words for w in hint_words):
+            rank = (1, 0)
+        else:
+            similarity = difflib.SequenceMatcher(None, hint_norm, base_norm).ratio()
+            if similarity < PDF_FUZZY_MATCH_THRESHOLD:
+                continue
+            rank = (2, -similarity)
+
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best_path = path
+
+    return best_path
+
+
 def _find_pdf_file(hint):
     """
-    Search PDF_SEARCH_DIRS for a PDF matching `hint`. Matching is fuzzy on
-    purpose, since spoken filenames rarely line up exactly with how a file
-    is actually named on disk:
+    Search the cached PDF index for a PDF matching `hint`. Matching is fuzzy
+    on purpose, since spoken filenames rarely line up exactly with how a
+    file is actually named on disk:
 
       1. Exact normalized substring match (best) - e.g. hint "project
          proposal" matches "Project_Proposal_Final.pdf".
@@ -926,40 +1278,20 @@ def _find_pdf_file(hint):
       3. Fallback: similarity-ratio fuzzy match, for typos/mis-hearings,
          accepted only above PDF_FUZZY_MATCH_THRESHOLD.
 
-    Returns the single best matching path, or None.
+    Returns the single best matching path, or None. If nothing matches and
+    the cached index is more than PDF_INDEX_MIN_REFRESH seconds old, the
+    folders are rescanned once in case the file is new.
     """
     hint_norm = _normalize_for_match(hint)
     if not hint_norm:
         return None
     hint_words = hint_norm.split()
 
-    best_path = None
-    best_rank = None  
-
-    for folder in PDF_SEARCH_DIRS:
-        if not os.path.isdir(folder):
-            continue
-        for path in glob.glob(os.path.join(folder, "**", "*.pdf"), recursive=True):
-            base_norm = _normalize_for_match(os.path.splitext(os.path.basename(path))[0])
-            if not base_norm:
-                continue
-            base_words = base_norm.split()
-
-            if hint_norm in base_norm:
-                rank = (0, 0)
-            elif all(w in base_words for w in hint_words):
-                rank = (1, 0)
-            else:
-                similarity = difflib.SequenceMatcher(None, hint_norm, base_norm).ratio()
-                if similarity < PDF_FUZZY_MATCH_THRESHOLD:
-                    continue
-                rank = (2, -similarity)
-
-            if best_rank is None or rank < best_rank:
-                best_rank = rank
-                best_path = path
-
-    return best_path
+    path = _match_pdf(hint_norm, hint_words, _get_pdf_index())
+    if path is None and time.time() - _pdf_index_time > PDF_INDEX_MIN_REFRESH:
+        path = _match_pdf(hint_norm, hint_words,
+                          _get_pdf_index(max_age=PDF_INDEX_MIN_REFRESH))
+    return path
 
 
 def _locate_pdf(name_hint=None):
@@ -1168,7 +1500,7 @@ def read_screen():
 
     screenshot = pyautogui.screenshot()
     try:
-        text = pytesseract.image_to_string(screenshot)
+        text = pytesseract.image_to_string(_shrink_for_ocr(screenshot)[0])
     except Exception as e:
         print(f"OCR error: {e}")
         speak("I couldn't read the screen. Is Tesseract installed?")
@@ -1189,12 +1521,7 @@ def read_screen():
 
 def _ocr_screen_words():
     """One OCR pass over the whole screen. Returns pytesseract's word-level dict, or None on failure."""
-    screenshot = pyautogui.screenshot()
-    try:
-        return pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
-    except Exception as e:
-        print(f"OCR error: {e}")
-        return None
+    return _ocr_data(pyautogui.screenshot())
 
 
 def _find_clickable_text(target, data, screenshot_size=None):
@@ -1273,13 +1600,8 @@ def click_on_screen(target, double=False):
         return False
 
     screenshot = pyautogui.screenshot()
-    try:
-        data = pytesseract.image_to_data(
-            screenshot,
-            output_type=pytesseract.Output.DICT
-        )
-    except Exception as e:
-        print(f"OCR error: {e}")
+    data = _ocr_data(screenshot)
+    if data is None:
         speak("I couldn't read the screen.")
         return False
 
@@ -1625,52 +1947,52 @@ def process_command(command):
     # tabs" must never fall into "close tab" (or vice versa).
     elif "close all tab" in command:
         close_all_tabs()
-        speak("Closed all tabs")
+        speak("Closed all tabs", wait=False)
 
     elif "close tab" in command or "close this tab" in command or "close the tab" in command or "close current tab" in command:
         close_tab()
-        speak("Closed the tab")
+        speak("Closed the tab", wait=False)
 
     # ---- MEDIA ----
 
     elif "next video" in command or command == "next":
         next_video()
-        speak("Next video")
+        speak("Next video", wait=False)
 
     elif "previous video" in command or "last video" in command:
         previous_video()
-        speak("Previous video")
+        speak("Previous video", wait=False)
 
-    elif "skip ad" in command or "skip the ad" in command or "skip this ad" in command or "skip ads" in command:
+    elif _is_skip_ad_command(command):
         skip_ad()
 
     elif "pause" in command or "play" in command:
         play_pause()
-        speak("Okay")
+        speak("Okay", wait=False)
 
     # ---- VOLUME ----
 
     elif "volume up" in command or "increase volume" in command:
         volume_up()
-        speak("Volume up")
+        speak("Volume up", wait=False)
 
     elif "volume down" in command or "decrease volume" in command:
         volume_down()
-        speak("Volume down")
+        speak("Volume down", wait=False)
 
     elif "mute" in command:
         mute()
-        speak("Muted")
+        speak("Muted", wait=False)
 
     # ---- BRIGHTNESS ----
 
     elif "brightness up" in command or "increase brightness" in command:
         brightness_up()
-        speak("Brightness up")
+        speak("Brightness up", wait=False)
 
     elif "brightness down" in command or "decrease brightness" in command:
         brightness_down()
-        speak("Brightness down")
+        speak("Brightness down", wait=False)
 
     elif "screenshot" in command or "take a screenshot" in command:
         take_screenshot()
@@ -1711,11 +2033,20 @@ def main():
     print("Say 'shutdown assistant' to quit.")
     print()
 
+    # Load the local speech model first (a few seconds; the first run also
+    # downloads it), so "nexon is ready" is actually true.
+    if RECOGNITION_ENGINE == "whisper":
+        _get_whisper()
+
     # Starts one continuously-open mic stream on its own background
     # thread (includes the ambient-noise calibration that used to happen
     # here directly) - this replaces the old "open mic, listen, close
     # mic, repeat" loop, so there's no gap where nexon isn't listening.
     stop_listening = start_background_listening()
+
+    # Build the PDF filename index in the background so the first
+    # "read pdf" doesn't have to wait for a folder scan.
+    threading.Thread(target=_get_pdf_index, daemon=True).start()
 
     speak("nexon is ready.")
 
