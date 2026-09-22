@@ -1,0 +1,19 @@
+SpeechRecognition
+pyttsx3
+PyAudio
+pyautogui
+screen-brightness-control
+keyboard
+pycaw
+comtypes
+pytesseract
+pygetwindow
+pywhatkit
+pymupdf
+Pillow
+requests
+beautifulsoup4
+
+# Optional but recommended: local speech recognition (no network round
+# trip). The first run downloads a small model (~150 MB for base.en).
+# faster-whisper
