@@ -497,7 +497,7 @@ def _use_local_engine():
 
 def _normalize_command_text(text):
     """
-    Whisper adds capitals and punctuation ("Nexon, next video."); the command
+    whisper adds capitals and punctuation ("nexon, next video."); the command
     matching below expects plain lowercase words like Google returned.
     """
     text = re.sub(r"[^\w\s]", " ", text.lower())
