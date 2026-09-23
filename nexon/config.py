@@ -148,6 +148,34 @@ SKIP_SCAN_LEFT = 0.0
 SKIP_SCAN_TOP = 0.25
 
 # --------------------------------------------------
+# SEARCH BAR AUTO-DETECT ("type ... and search")
+# --------------------------------------------------
+
+# OCR text tried (in this order) to guess where a page's/browser's
+# search box is, so "nexon type cats and search" doesn't require
+# clicking into the box yourself first. Best-effort: an icon-only
+# search field (a bare magnifying glass, no placeholder text) can't be
+# found this way, and the last, broadest entry ("search") could
+# occasionally land on an unrelated on-page button/link that also says
+# "search" - add more specific phrases above it if that happens on a
+# site you use a lot.
+SEARCH_BAR_HINTS = (
+    "search or type",              # Chrome/Edge address bar placeholder
+    "search google or type a url",
+    "search the web",
+    "type to search",
+    "search this site",
+    "search here",
+    "search products",
+    "search...",
+    "search",                      # last resort - broadest, least reliable
+)
+
+# Pause after clicking into a found search bar, before selecting its
+# existing text and typing - gives the field a moment to take focus.
+SEARCH_BAR_CLICK_DELAY = 0.15
+
+# --------------------------------------------------
 # PDF READING
 # --------------------------------------------------
 
@@ -187,6 +215,40 @@ SITE_SHORTCUTS = {
     "archiveofourown": "https://archiveofourown.org/",
     "archive of our own": "https://archiveofourown.org/",
 }
+
+# --------------------------------------------------
+# EMAIL
+# --------------------------------------------------
+#
+# Uses only the standard library (imaplib + email) - free, no API key,
+# works with any IMAP provider. Credentials are read from environment
+# variables rather than hardcoded here, so they never end up committed
+# to version control by accident.
+#
+# Gmail setup (free):
+#   1. Turn on 2-Step Verification: myaccount.google.com/security
+#   2. Create an App Password: myaccount.google.com/apppasswords
+#      (your normal Google password will NOT work over IMAP)
+#   3. Settings -> "Forwarding and POP/IMAP" -> Enable IMAP
+#   4. Set the two environment variables below to your address and
+#      that 16-character app password.
+#
+# Outlook/Yahoo/etc.: same idea (an app password once 2FA is on), just
+# a different IMAP_HOST - see the README.
+
+import os
+
+IMAP_HOST = "imap.gmail.com"
+IMAP_USER = os.environ.get("NEXON_EMAIL_USER", "")
+IMAP_PASSWORD = os.environ.get("NEXON_EMAIL_PASSWORD", "")
+
+# Folder/label names nexon checks for "check email". Gmail examples:
+# "INBOX", "[Gmail]/Starred", or any label name you've created.
+EMAIL_FOLDERS = ["INBOX"]
+
+# Cap on how many unread emails get read aloud per "check email", so a
+# swamped inbox doesn't turn into a five-minute monologue.
+MAX_EMAILS_SPOKEN = 5
 
 # --------------------------------------------------
 # SCREENSHOTS

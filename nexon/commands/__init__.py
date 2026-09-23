@@ -21,6 +21,7 @@ from . import volume
 from . import brightness
 from . import screen_reading   # must precede `browser`: "open/launch pdf ..."
                                 # needs to be claimed before browser's generic "open <site>"
+from . import mail             # no ordering constraint - distinct phrases
 from . import scrolling
 from . import click
 from . import files
@@ -33,6 +34,6 @@ from . import exit_             # keep last (before the registry's built-in fall
                                  # catches broad words like "exit"/"quit"/"goodbye"
 
 __all__ = [
-    "timer", "volume", "brightness", "screen_reading", "scrolling",
+    "timer", "volume", "brightness", "screen_reading", "mail", "scrolling",
     "click", "files", "dictation", "browser", "media", "system", "exit_",
 ]

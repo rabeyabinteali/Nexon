@@ -22,6 +22,9 @@ PATH or set `TESSERACT_CMD` in `nexon/config.py`.
 python run_nexon.py
 ```
 
+See **[commandlist.md](commandlist.md)** for every command and phrase
+variation nexon understands.
+
 ## Layout
 
 ```
@@ -42,6 +45,7 @@ nexon/
         volume.py
         brightness.py
         screen_reading.py    whatsapp / pdf / OCR screen reading / page nav
+        mail.py              check email / read latest email (IMAP)
         scrolling.py
         click.py
         files.py             delete file, empty recycle bin
@@ -99,7 +103,9 @@ Say you want a new browser command, e.g. "nexon reload page":
 2. Add one line to `nexon/commands/__init__.py`:
    `from . import your_feature`.
 
-### A note on ordering
+Please keep `commandlist.md` updated too when you add or change a command.
+
+## A note on ordering
 
 `@command` matches are tried in the order the *files* are imported in
 `nexon/commands/__init__.py`, and within a file, in the order the
@@ -119,6 +125,57 @@ never matters.
 
 A handler returns `True` (or nothing) to keep nexon running, or `False`
 to shut it down (used only by the exit command).
+
+## Email (free - standard library only, no API key)
+
+`nexon/commands/mail.py` checks email over IMAP using only `imaplib` +
+`email` from the Python standard library - no pip install, no paid API,
+works with any IMAP provider.
+
+**Commands:**
+- "check email" / "check my mail" / "any new emails" - unread count and
+  sender/subject for each, across every folder in `EMAIL_FOLDERS`
+- "check email in `<folder>`" - just that one folder
+- "read email" / "read latest email" - reads the newest unread email's
+  full body aloud
+
+**Setup (Gmail, free):**
+1. Turn on 2-Step Verification: https://myaccount.google.com/security
+2. Create an App Password: https://myaccount.google.com/apppasswords
+   (your normal Google password does not work over IMAP)
+3. Gmail Settings -> "Forwarding and POP/IMAP" -> Enable IMAP
+4. Set two environment variables (don't paste real credentials into
+   `config.py` - they'd end up committed to version control):
+   ```
+   setx NEXON_EMAIL_USER "you@gmail.com"
+   setx NEXON_EMAIL_PASSWORD "your16charapppassword"
+   ```
+   (open a new terminal afterward so the variables take effect)
+
+**Other providers:** same idea (an app password once 2FA is on), just a
+different `IMAP_HOST` in `config.py` - `outlook.office365.com` for
+Outlook/Hotmail, `imap.mail.yahoo.com` for Yahoo. Work/enterprise
+accounts sometimes disable basic IMAP auth entirely in favor of OAuth
+("modern auth") - if login fails with those, IMAP access may need to be
+turned on by an admin, or may not be available at all.
+
+**Folders:** `EMAIL_FOLDERS` in `config.py` is a list, so you can check
+several: `["INBOX", "[Gmail]/Starred", "Work"]`. Gmail labels show up as
+folders this way too.
+
+## WhatsApp
+
+`read_whatsapp()` (in `commands/screen_reading.py`) is OCR-based: it
+screenshots the WhatsApp Desktop window and reads the pixels. That's
+the practical free option for reading your own chats - the alternatives
+aren't a clean upgrade:
+- The official WhatsApp Business API has a free tier, but it's built
+  for businesses messaging customers, not for reading your own personal
+  chats.
+- Scraping WhatsApp Web with Selenium gets real text instead of OCR
+  guesses, but violates WhatsApp's Terms of Service for personal
+  accounts, breaks whenever they change their web UI, and risks the
+  account getting flagged.
 
 ## Notes carried over from the original single-file version
 

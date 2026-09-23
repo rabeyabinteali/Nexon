@@ -146,6 +146,45 @@ def click_on_screen(target, double=False, speak=None):
     return True
 
 
+def find_search_bar(screenshot=None, data=None):
+    """
+    Best-effort OCR search-box locator: tries each phrase in
+    config.SEARCH_BAR_HINTS (most specific first) against the OCR'd
+    screen and returns a screen point for the first one that matches,
+    or None if nothing looked like a search box. Pass an existing
+    screenshot/ocr_data() result if you already have one, to avoid
+    OCR-ing the screen twice.
+    """
+    screenshot = screenshot or pyautogui.screenshot()
+    data = data if data is not None else ocr_data(screenshot)
+    if data is None:
+        return None
+
+    for hint in config.SEARCH_BAR_HINTS:
+        point = find_clickable_text(hint, data, screenshot.size)
+        if point:
+            return point
+    return None
+
+
+def click_search_bar():
+    """
+    Locate a search box (see find_search_bar()), click into it, and
+    select + clear whatever text is already there so a follow-up
+    type_text() call overwrites it cleanly instead of appending to it.
+    Returns True if it found and clicked something.
+    """
+    point = find_search_bar()
+    if point is None:
+        return False
+
+    pyautogui.click(*point)
+    time.sleep(config.SEARCH_BAR_CLICK_DELAY)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.press("delete")
+    return True
+
+
 def find_and_click_skip_button():
     """
     One OCR pass over the screen: look for a word containing 'skip'.

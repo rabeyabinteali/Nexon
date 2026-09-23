@@ -34,6 +34,8 @@ def previous_video():
 def play_pause():
     pyautogui.press("space")
 
+def full_screen():
+    pyautogui.press("F")
 
 def is_skip_ad_command(command_text):
     """True for "skip ad", "skip the ad", "skip ads", and common mishearings like "skip add" / "skip a d"."""
@@ -85,3 +87,10 @@ def handle_skip_ad(command_text):
 def handle_play_pause(command_text):
     play_pause()
     speak("Okay", wait=False)
+
+
+@command(lambda cmd: "fullscreen" in cmd)
+def handle_play_pause(command_text):
+    full_screen()
+    speak("Okay", wait=False)
+

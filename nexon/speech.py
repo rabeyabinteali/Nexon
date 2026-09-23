@@ -29,6 +29,7 @@ listening.
 """
 
 import queue
+import os
 import re
 import socket
 import threading
@@ -67,9 +68,10 @@ _whisper_lock = threading.Lock()
 
 def _get_whisper():
     """
-    Load the local model once (first call downloads it). Returns the
-    model, or None if it isn't available - in which case callers use
-    Google.
+    Load the local model once (first call downloads it - requires
+    internet the very first time; cached under ~/.cache/huggingface
+    after that). Returns the model, or None if it isn't available - in
+    which case callers use Google.
     """
     global _whisper_model, _whisper_failed
     if _whisper_model is not None or _whisper_failed:
@@ -78,20 +80,48 @@ def _get_whisper():
     with _whisper_lock:
         if _whisper_model is not None or _whisper_failed:
             return _whisper_model
+
         try:
             import numpy as np
             from faster_whisper import WhisperModel
+        except ImportError as e:
+            print(f"faster-whisper isn't installed ({e}). Run: pip install faster-whisper")
+            _whisper_failed = True
+            return None
 
-            print(f"Loading local speech model '{config.WHISPER_MODEL}' (first run downloads it)...")
+        print(f"Loading local speech model '{config.WHISPER_MODEL}' (first run downloads it)...")
+        try:
             model = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
+        except Exception as e:
+            # huggingface_hub sometimes tries to phone home to check for
+            # updates before using an already-downloaded model, and can
+            # raise a connection error instead of just falling back to
+            # the cache when there's no internet. If the model was
+            # downloaded on a previous (online) run, this forces it to
+            # use exactly those cached files instead of trying the
+            # network again.
+            print(f"Whisper load hit a network error ({e}); retrying from the local cache only...")
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            try:
+                model = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
+            except Exception as e2:
+                print(f"Local speech model unavailable ({e2}).")
+                print("If you've never run nexon with an internet connection on this machine, "
+                      "the model has never actually been downloaded - connect once so it can "
+                      "cache it, then it'll work offline from then on.")
+                _whisper_failed = True
+                return None
+
+        try:
             # Warm-up: the very first inference is always slower.
             list(model.transcribe(np.zeros(16000, dtype="float32"), language="en")[0])
-            _whisper_model = model
-            print("Local speech model ready.")
         except Exception as e:
             print(f"Local speech model unavailable ({e}).")
-            print("Using Google recognition instead. For faster recognition: pip install faster-whisper")
             _whisper_failed = True
+            return None
+
+        _whisper_model = model
+        print("Local speech model ready.")
     return _whisper_model
 
 
@@ -103,8 +133,12 @@ def preload_whisper():
     loading it for the first time mid-conversation would stall nexon
     right when the network just failed.
     """
-    if config.RECOGNITION_ENGINE in ("whisper", "auto"):
-        _get_whisper()
+    if config.RECOGNITION_ENGINE in ("whisper", "auto") and _get_whisper() is None:
+        if config.RECOGNITION_ENGINE == "auto":
+            print("NOTE: local speech recognition isn't available, so 'auto' mode has no "
+                  "offline fallback right now - if the network drops, nexon won't understand "
+                  "anything until it's back, instead of switching to local recognition. "
+                  "See the message above for why.")
 
 
 # --------------------------------------------------
