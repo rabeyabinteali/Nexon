@@ -89,7 +89,7 @@ def handle_play_pause(command_text):
     speak("Okay", wait=False)
 
 
-@command(lambda cmd: "fullscreen" in cmd)
+@command(lambda cmd: "fullscreen" in cmd or "full screen" in cmd)
 def handle_play_pause(command_text):
     full_screen()
     speak("Okay", wait=False)
